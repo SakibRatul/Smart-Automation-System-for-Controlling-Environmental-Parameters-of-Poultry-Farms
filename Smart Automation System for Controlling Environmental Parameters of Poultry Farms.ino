@@ -3,10 +3,15 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <ThingSpeak.h>
+#include <RTClib.h>  // Include the library for DS3231 RTC
+
+// -----------------------------
+// Configuration Constants
+// -----------------------------
 
 // WiFi credentials
-const char* ssid = "Bap";
-const char* password = "1234512345";
+const char* ssid = "Intellier-KB";
+const char* password = "IntellierKb@4321";
 
 // ThingSpeak channel details
 unsigned long myChannelNumber = 2679819;
@@ -24,30 +29,44 @@ const char * myWriteAPIKey = "PUSDW8QJGZAL6ZXT";
 // Define the microSD card CS pin
 #define SD_CS_PIN 5  // Chip select for the SD card
 
-// Relay pins for bulbs and fan
-#define BULB1_PIN 26  // Relay pin for Bulb 1
-#define BULB2_PIN 27  // Relay pin for Bulb 2
-#define FAN_PIN 14    // Relay pin for Exhaust Fan
+// Relay pin definitions
+#define RELAY1_PIN 16  // First bulb relay
+#define RELAY2_PIN 17  // Second bulb relay
+#define RELAY3_PIN 27  // Exhaust fan relay
+#define RELAY4_PIN 14  // Unused relay, you can connect additional device
 
-// Threshold values for temperature and humidity
-const float tempThresholdLow = 25.0;  // Lower threshold for temperature (in degrees Celsius)
-const float tempThresholdHigh = 35.0; // Higher threshold for temperature (in degrees Celsius)
-const float humThresholdLow = 75.0;   // Lower threshold for humidity (in percentage)
-const float humThresholdHigh = 80.0;  // Higher threshold for humidity (in percentage)
+// Thresholds for DHT11 sensor
+const float lowTempThreshold = 26.0;  // Temperature threshold for turning on bulbs
+const float highTempThreshold = 32.0; // Temperature threshold for turning on exhaust fan
+
+// Loop delay in milliseconds
+const unsigned long LOOP_DELAY = 5000; // 5 seconds
+
+// -----------------------------
+// Global Objects
+// -----------------------------
 
 // Create DHT objects
 DHT dht1(DHT1_PIN, DHTTYPE);
 DHT dht2(DHT2_PIN, DHTTYPE);
 
-// Create WiFiClient object
-WiFiClient client;
-
 // File object for writing to SD card
 File dataFile;
+
+// RTC object for DS3231
+RTC_DS3231 rtc;
+
+// WiFiClient object
+WiFiClient client;
+
+// -----------------------------
+// Setup Function
+// -----------------------------
 
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
+  Serial.println("System initializing...");
 
   // Start the DHT sensors
   dht1.begin();
@@ -57,44 +76,59 @@ void setup() {
   pinMode(MQ5_PIN, INPUT);
   pinMode(MQ135_PIN, INPUT);
 
-  // Initialize relay pins for bulbs and fan
-  pinMode(BULB1_PIN, OUTPUT);
-  pinMode(BULB2_PIN, OUTPUT);
-  pinMode(FAN_PIN, OUTPUT);
-
-  // Set initial states of relays to off
-  digitalWrite(BULB1_PIN, LOW);
-  digitalWrite(BULB2_PIN, LOW);
-  digitalWrite(FAN_PIN, LOW);
-
   // Initialize the microSD card
   if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("Card failed, or not present.");
+    Serial.println("SD card initialization failed! Halting.");
     while (1); // Halt the execution if SD card initialization fails
   }
   Serial.println("SD card initialized successfully.");
 
-  // Connect to Wi-Fi with retry mechanism
+  // Initialize relays
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+  pinMode(RELAY4_PIN, OUTPUT);
+
+  // Set all relays to off at the beginning
+  digitalWrite(RELAY1_PIN, LOW);
+  digitalWrite(RELAY2_PIN, LOW);
+  digitalWrite(RELAY3_PIN, LOW);
+  digitalWrite(RELAY4_PIN, LOW);
+
+  // Initialize the RTC
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC. Halting.");
+    while (1);
+  }
+
+  // Check if the RTC lost power and if so, set the time
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting the time!");
+    // The following line sets the RTC to the date & time this sketch was compiled
+    rtc.adjust(DateTime(__DATE__, __TIME__));
+  }
+
+  // Connect to Wi-Fi
+  Serial.print("Connecting to WiFi");
   WiFi.begin(ssid, password);
-  int wifiRetryCount = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiRetryCount < 30) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
-    Serial.println("Connecting to WiFi...");
-    wifiRetryCount++;
+    Serial.print(".");
   }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Connected to WiFi");
-  } else {
-    Serial.println("Failed to connect to WiFi, check credentials or router.");
-    while (1); // Halt if Wi-Fi connection fails
-  }
+  Serial.println("\nConnected to WiFi");
 
   // Initialize ThingSpeak
-  ThingSpeak.begin(client);
+  ThingSpeak.begin(client);  // Pass the WiFiClient object instead of WiFi
 }
 
+// -----------------------------
+// Loop Function
+// -----------------------------
+
 void loop() {
+  // Read the current time from RTC
+  DateTime now = rtc.now();
+
   // Read temperature and humidity from the first DHT11 sensor
   float temp1 = dht1.readTemperature();
   float hum1 = dht1.readHumidity();
@@ -107,28 +141,59 @@ void loop() {
   int mq5Value = analogRead(MQ5_PIN);
   int mq135Value = analogRead(MQ135_PIN);
 
-  // Check if any reading from DHT11 is failed and handle errors
-  if (isnan(temp1) || isnan(hum1) || isnan(temp2) || isnan(hum2)) {
-    Serial.println("Failed to read from DHT sensor!");
-  } else {
+  // Validate sensor readings
+  bool validReadings = true;
+  if (isnan(temp1) || isnan(hum1)) {
+    Serial.println("Error: Failed to read from DHT11 Sensor 1!");
+    validReadings = false;
+  }
+  if (isnan(temp2) || isnan(hum2)) {
+    Serial.println("Error: Failed to read from DHT11 Sensor 2!");
+    validReadings = false;
+  }
+
+  // Optionally, validate analog sensor readings
+  if (mq5Value < 0 || mq5Value > 4095) { // ESP32 ADC is 12-bit
+    Serial.println("Error: Invalid MQ-5 sensor reading!");
+    validReadings = false;
+  }
+  if (mq135Value < 0 || mq135Value > 4095) {
+    Serial.println("Error: Invalid MQ-135 sensor reading!");
+    validReadings = false;
+  }
+
+  if (validReadings) {
     // Print sensor values to serial monitor
+    Serial.println("\n--- Sensor Readings ---");
+    Serial.print("Timestamp: ");
+    Serial.print(now.year(), DEC);
+    Serial.print('/');
+    Serial.print(now.month(), DEC);
+    Serial.print('/');
+    Serial.print(now.day(), DEC);
+    Serial.print(" ");
+    Serial.print(now.hour(), DEC);
+    Serial.print(':');
+    Serial.print(now.minute(), DEC);
+    Serial.print(':');
+    Serial.println(now.second(), DEC);
+
     Serial.println("DHT11 Sensor 1:");
-    Serial.print("Temperature: ");
+    Serial.print("  Temperature: ");
     Serial.print(temp1);
     Serial.println(" *C");
-    Serial.print("Humidity: ");
+    Serial.print("  Humidity: ");
     Serial.print(hum1);
     Serial.println(" %");
 
     Serial.println("DHT11 Sensor 2:");
-    Serial.print("Temperature: ");
+    Serial.print("  Temperature: ");
     Serial.print(temp2);
     Serial.println(" *C");
-    Serial.print("Humidity: ");
+    Serial.print("  Humidity: ");
     Serial.print(hum2);
     Serial.println(" %");
 
-    // Print MQ sensor values to serial monitor
     Serial.print("MQ-5 Gas Sensor Value: ");
     Serial.println(mq5Value);
     Serial.print("MQ-135 Gas Sensor Value: ");
@@ -137,8 +202,22 @@ void loop() {
     // Open file for writing to SD card
     dataFile = SD.open("/sensor_data.txt", FILE_WRITE);
 
-    // If the file is available, write the sensor data
+    // If the file is available, write the sensor data along with timestamp
     if (dataFile) {
+      // Write the current time from RTC
+      dataFile.print("Timestamp: ");
+      dataFile.print(now.year(), DEC);
+      dataFile.print('/');
+      dataFile.print(now.month(), DEC);
+      dataFile.print('/');
+      dataFile.print(now.day(), DEC);
+      dataFile.print(" ");
+      dataFile.print(now.hour(), DEC);
+      dataFile.print(':');
+      dataFile.print(now.minute(), DEC);
+      dataFile.print(':');
+      dataFile.println(now.second(), DEC);
+
       // Log DHT11 sensor values
       dataFile.print("DHT11 Sensor 1: ");
       dataFile.print("Temp: ");
@@ -164,6 +243,7 @@ void loop() {
 
       // Close the file after writing
       dataFile.close();
+      Serial.println("Data written to SD card.");
     } else {
       // If the file couldn't be opened, print an error
       Serial.println("Error opening sensor_data.txt");
@@ -185,29 +265,30 @@ void loop() {
       Serial.println("Failed to send data to ThingSpeak. Response code: " + String(responseCode));
     }
 
-    // Relay control logic for bulbs and exhaust fan
-
-    // Check if both sensors are below the lower threshold for temp and humidity
-    if (temp1 < tempThresholdLow && temp2 < tempThresholdLow && hum1 < humThresholdLow && hum2 < humThresholdLow) {
-      digitalWrite(BULB1_PIN, HIGH);  // Turn on Bulb 1
-      digitalWrite(BULB2_PIN, HIGH);  // Turn on Bulb 2
-      Serial.println("Bulbs turned on.");
+    // Control relay based on temperature thresholds
+    if (temp1 < lowTempThreshold && temp2 < lowTempThreshold) {
+      // Turn on both bulbs
+      digitalWrite(RELAY1_PIN, HIGH);
+      digitalWrite(RELAY2_PIN, HIGH);
+      Serial.println("Both bulbs turned ON");
     } else {
-      digitalWrite(BULB1_PIN, LOW);   // Turn off Bulb 1
-      digitalWrite(BULB2_PIN, LOW);   // Turn off Bulb 2
-      Serial.println("Bulbs turned off.");
+      // Turn off both bulbs
+      digitalWrite(RELAY1_PIN, LOW);
+      digitalWrite(RELAY2_PIN, LOW);
+      Serial.println("Both bulbs turned OFF");
     }
 
-    // Check if both sensors exceed the higher threshold for temp or humidity
-    if ((temp1 > tempThresholdHigh && temp2 > tempThresholdHigh) || (hum1 > humThresholdHigh && hum2 > humThresholdHigh)) {
-      digitalWrite(FAN_PIN, HIGH);  // Turn on the exhaust fan
-      Serial.println("Exhaust fan turned on.");
+    if (temp1 > highTempThreshold || temp2 > highTempThreshold) {
+      // Turn on exhaust fan
+      digitalWrite(RELAY3_PIN, HIGH);
+      Serial.println("Exhaust fan turned ON");
     } else {
-      digitalWrite(FAN_PIN, LOW);   // Turn off the exhaust fan
-      Serial.println("Exhaust fan turned off.");
+      // Turn off exhaust fan
+      digitalWrite(RELAY3_PIN, LOW);
+      Serial.println("Exhaust fan turned OFF");
     }
   }
 
-  // Add delay for readability and cloud upload
-  delay(20000); // Delay of 20 seconds before next reading
+  // Delay before next loop iteration
+  delay(LOOP_DELAY);  // Delay for 5 seconds
 }
